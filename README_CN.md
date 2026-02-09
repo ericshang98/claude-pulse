@@ -66,7 +66,7 @@ Claude Pulse 利用 macOS 的 `launchd` 调度轻量级触发。每次触发只�
 ## 安装
 
 ```bash
-git clone https://github.com/anthropics/claude-pulse.git
+git clone https://github.com/ericshang98/claude-pulse.git
 cd claude-pulse
 bash install.sh
 ```
@@ -143,6 +143,31 @@ sudo pmset repeat cancel
 ## 为什么叫 "Pulse"？
 
 Pulse 是脉搏，是最微小的生命迹象。Claude Pulse 做的就是这件事——发送一次心跳，让你的 token 配额保持活力。
+
+## 作者
+
+<a href="https://github.com/ericshang98">
+  <img src="https://avatars.githubusercontent.com/u/200189264?v=4" width="80" style="border-radius:50%" alt="Eric Shang"/>
+</a>
+
+**[Eric Shang](https://github.com/ericshang98)** — AI 原生工具构建者。同时在做 [Nexting AI](https://github.com/ericshang98)（AI 驱动的 SEO 平台）和 [Perfect Web Clone](https://github.com/ericshang98/Perfect-Web-Clone)（AI 网页克隆，40+ 专用工具）。
+
+- Twitter/X: [@EricShang98](https://twitter.com/EricShang98)
+
+## 参与共创
+
+Claude Pulse 是开源项目，欢迎一起共创！无论是 Linux/Windows 支持、新的调度功能，还是更好的交互体验——欢迎提 PR 和 Issue。
+
+```bash
+# Fork, clone, hack, PR
+git clone https://github.com/<your-username>/claude-pulse.git
+```
+
+### 贡献者
+
+<a href="https://github.com/ericshang98/claude-pulse/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=ericshang98/claude-pulse" />
+</a>
 
 ## 许可证
 

@@ -66,7 +66,7 @@ Cross-midnight triggers show both dates:
 ## Installation
 
 ```bash
-git clone https://github.com/anthropics/claude-pulse.git
+git clone https://github.com/ericshang98/claude-pulse.git
 cd claude-pulse
 bash install.sh
 ```
@@ -143,6 +143,31 @@ sudo pmset repeat cancel
 ## Why "Pulse"?
 
 A pulse is the smallest sign of life. That's exactly what Claude Pulse sends — a single heartbeat to keep your token quota alive.
+
+## Author
+
+<a href="https://github.com/ericshang98">
+  <img src="https://avatars.githubusercontent.com/u/200189264?v=4" width="80" style="border-radius:50%" alt="Eric Shang"/>
+</a>
+
+**[Eric Shang](https://github.com/ericshang98)** — Builder of AI-native tools. Also building [Nexting AI](https://github.com/ericshang98) (AI-driven SEO platform) and [Perfect Web Clone](https://github.com/ericshang98/Perfect-Web-Clone) (AI web cloning with 40+ tools).
+
+- Twitter/X: [@EricShang98](https://twitter.com/EricShang98)
+
+## Contributing
+
+Claude Pulse is open source and welcomes contributions! Whether it's Linux/Windows support, new scheduling features, or better TUI — PRs and issues are welcome.
+
+```bash
+# Fork, clone, hack, PR
+git clone https://github.com/<your-username>/claude-pulse.git
+```
+
+### Contributors
+
+<a href="https://github.com/ericshang98/claude-pulse/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=ericshang98/claude-pulse" />
+</a>
 
 ## License
 
