@@ -150,7 +150,7 @@ Pulse 是脉搏，是最微小的生命迹象。Claude Pulse 做的就是这件�
   <img src="https://avatars.githubusercontent.com/u/200189264?v=4" width="80" style="border-radius:50%" alt="Eric Shang"/>
 </a>
 
-**[Eric Shang](https://github.com/ericshang98)** — AI 原生工具构建者。同时在做 [Nexting AI](https://github.com/ericshang98)（AI 驱动的 SEO 平台）和 [Perfect Web Clone](https://github.com/ericshang98/Perfect-Web-Clone)（AI 网页克隆，40+ 专用工具）。
+**[Eric Shang](https://github.com/ericshang98)** — AI 原生工具构建者。同时在做 [Nexting AI](https://github.com/ericshang98)（AEO 平台）和 [Perfect Web Clone](https://github.com/ericshang98/Perfect-Web-Clone)。
 
 - Twitter/X: [@EricShang98](https://twitter.com/EricShang98)
 

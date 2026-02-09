@@ -150,7 +150,7 @@ A pulse is the smallest sign of life. That's exactly what Claude Pulse sends —
   <img src="https://avatars.githubusercontent.com/u/200189264?v=4" width="80" style="border-radius:50%" alt="Eric Shang"/>
 </a>
 
-**[Eric Shang](https://github.com/ericshang98)** — Builder of AI-native tools. Also building [Nexting AI](https://github.com/ericshang98) (AI-driven SEO platform) and [Perfect Web Clone](https://github.com/ericshang98/Perfect-Web-Clone) (AI web cloning with 40+ tools).
+**[Eric Shang](https://github.com/ericshang98)** — Builder of AI-native tools. Also building [Nexting AI](https://github.com/ericshang98) (AEO platform) and [Perfect Web Clone](https://github.com/ericshang98/Perfect-Web-Clone).
 
 - Twitter/X: [@EricShang98](https://twitter.com/EricShang98)
 
