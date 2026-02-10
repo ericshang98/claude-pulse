@@ -1,39 +1,80 @@
 # Claude Pulse
 
-**Keep your Claude Code tokens fresh while you sleep.**
+**Keep your Claude Code tokens fresh — and let Claude work while you sleep.**
 
 [中文文档](README_CN.md)
 
 ---
 
-> Tired of Claude Code's 5-hour token quota limit? Do your tokens run out before your ideas do?
+> Tired of Claude Code's 5-hour token quota limit? Want Claude to handle tasks overnight while you rest?
 
 Claude Code resets its token quota every **5 hours from your last usage**. That means every night you sleep through a refresh window. Every morning you sit down to code, you're already behind.
 
-**Claude Pulse** fixes this. It automatically triggers a minimal Claude Code request at times you choose — so your token quota is always fresh when you need it.
+**Claude Pulse** fixes this. It schedules triggers at times you choose — a minimal pulse to keep tokens fresh, or **real tasks** that Claude Code executes autonomously. Multiple tasks per trigger, all running in parallel.
 
 ## How It Works
 
 ```
-   You sleep          Claude Pulse fires        You wake up
-   zzz...      →      03:30 trigger (1 token)  →  Quota is fresh!
-                       08:30 trigger (1 token)     Ready to code.
+   You sleep          Claude Pulse fires             You wake up
+   zzz...      →      03:30  pulse (token refresh)  →  Quota is fresh!
+                       03:30  "Review code changes"     Code reviewed!
+                       03:30  "Run all tests"           Tests passed!
+                                                        Ready to go.
 ```
 
-Claude Pulse uses macOS `launchd` to schedule lightweight triggers. Each trigger sends a single-word prompt to Claude Code (`"reply with only the word: pulse"`), consuming ~1 token and costing ~$0.01. This resets your 5-hour quota timer.
+Claude Pulse uses macOS `launchd` to schedule triggers. Each trigger can run one or more tasks **in parallel**:
+
+- **Pulse** — a single-word prompt (~1 token, ~$0.01) to reset your quota timer
+- **Prompt** — a custom instruction that Claude Code executes autonomously (with configurable max turns and work directory)
 
 For nighttime triggers, it can even wake your Mac from sleep using `pmset`.
 
 ## Features
 
-- **Zero typing setup** — fully interactive TUI with arrow keys, no text input needed
+- **Multi-task triggers** — attach multiple tasks (pulse + prompts) to a single trigger time
+- **Parallel execution** — all tasks in a trigger run concurrently, not sequentially
+- **Custom prompts** — schedule real work for Claude: code reviews, test runs, refactoring
+- **Per-task logging** — `Task 1/3 [pulse] SUCCESS: 14s`, `Task 2/3 [prompt] SUCCESS: 42s`
+- **Zero typing setup** — fully interactive TUI with arrow keys
 - **Smart time grid** — 30-minute interval slots with real-time effective window preview
 - **Recurring triggers** — set daily schedules (e.g., 03:30, 08:30, 13:30)
-- **One-time triggers** — schedule specific date + time (e.g., Feb 10 at 07:30)
-- **Cross-day awareness** — shows full date range when effective window spans midnight
+- **One-time triggers** — schedule specific date + time
 - **Auto wake from sleep** — `pmset` integration for nighttime triggers (00:00–06:59)
 - **Auto cleanup** — expired one-time triggers and old logs are removed automatically
-- **Retry logic** — network check + automatic retry on failure
+- **Smart retry** — pulse tasks retry on failure; prompt tasks don't (to avoid duplicate work)
+- **Auto-migration** — v1 configs are automatically upgraded to v2
+
+## Setup Example
+
+```
+  === Claude Pulse Setup ===
+
+  Configured triggers:
+    One-time 2026-02-10 01:30:
+      - pulse
+    One-time 2026-02-10 13:30:
+      - prompt: "检查一下这个产品的报错问题" (5 turns)
+
+  What would you like to do?
+  ▸ Apply and finish
+```
+
+The task configuration flow — after selecting a time, you choose what Claude should do:
+
+```
+  Task for 13:30:
+    Pulse (token refresh)
+  ▸ Custom prompt (Claude executes a task)
+
+  Enter prompt for Claude:
+  > 检查一下这个产品的报错问题
+
+  Max turns:
+  ▸ 5 (Recommended)
+
+  Add another task?
+  ▸ No, done
+```
 
 ## The Effective Window
 
@@ -83,7 +124,8 @@ That's it. Use arrow keys to:
 
 1. Choose **"Add recurring daily triggers"** or **"Add one-time trigger"**
 2. Select time slots from the visual grid (Space to toggle, Enter to confirm)
-3. Choose **"Apply and finish"**
+3. Configure tasks for each new time — **Pulse** or **Custom prompt**
+4. Choose **"Apply and finish"**
 
 Claude Pulse handles the rest — config, launchd agents, pmset wake schedules.
 
@@ -91,16 +133,34 @@ Claude Pulse handles the rest — config, launchd agents, pmset wake schedules.
 
 | Command | Description |
 |---------|-------------|
-| `claude-pulse setup` | Interactive configuration |
+| `claude-pulse setup` | Interactive configuration (triggers + tasks) |
 | `claude-pulse start` | Enable all triggers |
 | `claude-pulse stop` | Disable all triggers |
-| `claude-pulse status` | Show current state |
+| `claude-pulse status` | Show state and configured tasks |
 | `claude-pulse logs` | Recent trigger logs |
 | `claude-pulse logs --today` | Today's logs |
 | `claude-pulse logs -n 50` | Last 50 entries |
 | `claude-pulse logs 2026-02-10` | Logs for specific date |
 
-## Example: Optimal 24h Coverage
+## Example: Overnight Code Review + Token Refresh
+
+Set up a nightly trigger at 03:30 with two tasks:
+
+```
+  Daily 03:30:
+    - pulse
+    - prompt: "Review recent changes for bugs" (10 turns)
+```
+
+Both tasks run **in parallel**. Logs show per-task results:
+
+```
+[2026-02-10 03:30:05] Task 1/2 [pulse] SUCCESS: 8s
+[2026-02-10 03:30:47] Task 2/2 [prompt] SUCCESS: 42s "Review recent changes for bugs"
+[2026-02-10 03:30:47] Trigger finished: 2 succeeded, 0 failed out of 2 tasks
+```
+
+## Example: 24h Token Coverage
 
 To maximize token availability throughout the day, set triggers every 5 hours:
 
@@ -111,21 +171,51 @@ Coverage:  03-08     08-13     13-18     18-23     23-04
 
 That's 5 triggers/day at ~$0.01 each = **~$0.05/day** for always-fresh tokens.
 
+## Config Schema (v2)
+
+```json
+{
+  "config_version": 2,
+  "claude_path": "/Users/you/.local/bin/claude",
+  "work_directory": "~",
+  "enabled": true,
+  "recurring_triggers": [
+    {
+      "time": "03:30",
+      "tasks": [
+        {"mode": "pulse"},
+        {"mode": "prompt", "prompt": "Review code changes", "max_turns": 10}
+      ]
+    }
+  ],
+  "onetime_triggers": [
+    {
+      "date": "2026-02-11",
+      "time": "01:00",
+      "tasks": [{"mode": "prompt", "prompt": "Run all tests", "max_turns": 5}]
+    }
+  ]
+}
+```
+
+Existing v1 configs are automatically migrated on first run.
+
 ## How It Works (Technical)
 
 1. `claude-pulse setup` generates:
-   - `~/.claude-pulse/config.json` — your configuration
+   - `~/.claude-pulse/config.json` — your configuration (v2 schema)
    - `~/.claude-pulse/trigger.sh` — the trigger script
    - `~/Library/LaunchAgents/com.claude-pulse.*.plist` — one launchd agent per trigger
 
-2. Each launchd agent runs `caffeinate -i trigger.sh` at the scheduled time
+2. Each launchd agent runs `caffeinate -i trigger.sh <type> <time> [date]`
 
 3. `trigger.sh`:
    - Checks if pulse is enabled
    - Verifies network connectivity (retries once after 30s)
-   - Runs `claude -p "reply with only the word: pulse" --max-turns 1`
-   - Logs the result to `~/.claude-pulse/logs/`
-   - Retries once on failure
+   - Reads tasks for this trigger from config
+   - Launches all tasks **in parallel** (background processes)
+   - Waits for all to complete, logs per-task results
+   - Pulse tasks retry on failure; prompt tasks don't
    - Cleans up expired one-time triggers and old logs (>30 days)
 
 ## Uninstall
@@ -142,7 +232,7 @@ sudo pmset repeat cancel
 
 ## Why "Pulse"?
 
-A pulse is the smallest sign of life. That's exactly what Claude Pulse sends — a single heartbeat to keep your token quota alive.
+A pulse is the smallest sign of life. That's exactly what Claude Pulse sends — a single heartbeat to keep your token quota alive. And now, it can do real work while it's at it.
 
 ## Author
 

@@ -35,16 +35,51 @@ json_get() {
     python3 -c "import json; print(json.load(open('$1')).get('$2',''))"
 }
 
-json_get_array() {
-    python3 -c "import json; print(' '.join(json.load(open('$1')).get('$2',[])))"
-}
-
 json_set_bool() {
     python3 << PYEOF
 import json
 with open("$1") as f: d = json.load(f)
 d["$2"] = $3
 with open("$1", "w") as f: json.dump(d, f, indent=2); f.write("\n")
+PYEOF
+}
+
+# ── Config migration (v1 → v2) ─────────────────────────────────────
+
+migrate_config_if_needed() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    python3 << 'PYEOF'
+import json, os, sys
+cfg = os.path.expanduser("~/.claude-pulse/config.json")
+with open(cfg) as f:
+    d = json.load(f)
+if "recurring_times" not in d:
+    sys.exit(0)
+
+recurring_triggers = []
+for t in d.get("recurring_times", []):
+    recurring_triggers.append({"time": t, "tasks": [{"mode": "pulse"}]})
+
+onetime_triggers = []
+for t in d.get("onetime_triggers", []):
+    onetime_triggers.append({
+        "date": t["date"],
+        "time": t["time"],
+        "tasks": [{"mode": "pulse"}]
+    })
+
+new_config = {
+    "config_version": 2,
+    "claude_path": d.get("claude_path", ""),
+    "work_directory": d.get("work_directory", os.path.expanduser("~")),
+    "enabled": d.get("enabled", True),
+    "recurring_triggers": recurring_triggers,
+    "onetime_triggers": onetime_triggers
+}
+
+with open(cfg, "w") as f:
+    json.dump(new_config, f, indent=2)
+    f.write("\n")
 PYEOF
 }
 
@@ -303,6 +338,77 @@ ui_date_selector() {
     UI_DATE_RESULT="${dates[$sel]}"
 }
 
+# Configure tasks for a trigger time.
+# Sets UI_TASKS_RESULT as a JSON array string.
+ui_configure_tasks() {
+    local time_str="$1"
+    local tasks_json="[]"
+
+    while true; do
+        ui_menu "Task for $time_str:" \
+            "Pulse (token refresh)" \
+            "Custom prompt (Claude executes a task)"
+
+        case $UI_MENU_RESULT in
+            0)  # Pulse
+                tasks_json=$(echo "$tasks_json" | python3 -c "
+import json, sys
+tasks = json.load(sys.stdin)
+tasks.append({'mode': 'pulse'})
+print(json.dumps(tasks))
+")
+                success "Added pulse task"
+                ;;
+            1)  # Custom prompt
+                tput cnorm
+                echo ""
+                echo -e "  ${BOLD}Enter prompt for Claude:${NC}"
+                echo -n "  > "
+                local prompt_text=""
+                IFS= read -r prompt_text
+
+                if [[ -z "$prompt_text" ]]; then
+                    warn "Empty prompt, skipping"
+                    continue
+                fi
+
+                # Max turns
+                ui_menu "Max turns:" "5 (Recommended)" "1" "10" "20"
+                local -a max_turns_map=(5 1 10 20)
+                local max_turns=${max_turns_map[$UI_MENU_RESULT]}
+
+                # Work directory
+                ui_menu "Work directory:" "Default (~)" "Custom path"
+                local work_dir=""
+                if [[ $UI_MENU_RESULT -eq 1 ]]; then
+                    tput cnorm
+                    echo ""
+                    echo -n "  Path: "
+                    IFS= read -r work_dir
+                fi
+
+                # Build task JSON safely via env vars
+                tasks_json=$(PROMPT_TEXT="$prompt_text" MAX_TURNS="$max_turns" WORK_DIR="$work_dir" TASKS="$tasks_json" python3 -c "
+import json, os
+tasks = json.loads(os.environ['TASKS'])
+task = {'mode': 'prompt', 'prompt': os.environ['PROMPT_TEXT'], 'max_turns': int(os.environ['MAX_TURNS'])}
+wd = os.environ['WORK_DIR']
+if wd:
+    task['work_directory'] = wd
+tasks.append(task)
+print(json.dumps(tasks))
+")
+                success "Added prompt task"
+                ;;
+        esac
+
+        ui_menu "Add another task?" "No, done" "Yes, add another"
+        [[ $UI_MENU_RESULT -eq 0 ]] && break
+    done
+
+    UI_TASKS_RESULT="$tasks_json"
+}
+
 # ── Trigger script generation ───────────────────────────────────────
 
 generate_trigger_script() {
@@ -317,7 +423,7 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_DIR/pulse-$(date +%Y-%m-%d).log"
 }
 
-log "Trigger started"
+log "Trigger started (args: $*)"
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
     log "ERROR: Config not found"; exit 1
@@ -329,7 +435,7 @@ if [[ "$ENABLED" != "True" ]]; then
 fi
 
 CLAUDE_PATH=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['claude_path'])")
-WORK_DIR=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['work_directory'])")
+DEFAULT_WORK_DIR=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['work_directory'])")
 
 check_net() { host api.anthropic.com > /dev/null 2>&1; }
 if ! check_net; then
@@ -337,22 +443,130 @@ if ! check_net; then
     check_net || { log "ERROR: No network"; exit 1; }
 fi
 
-cd "$WORK_DIR" || { log "ERROR: cd $WORK_DIR failed"; exit 1; }
+# Get tasks from config based on trigger arguments
+TRIGGER_TYPE="${1:-}"
+TRIGGER_TIME="${2:-}"
+TRIGGER_DATE="${3:-}"
 
-run_pulse() {
+if [[ -z "$TRIGGER_TYPE" ]]; then
+    # Backward compat: no args → single pulse
+    TASKS_JSON='{"mode":"pulse"}'
+else
+    TASKS_JSON=$(TRIGGER_TYPE="$TRIGGER_TYPE" TRIGGER_TIME="$TRIGGER_TIME" TRIGGER_DATE="$TRIGGER_DATE" python3 -c "
+import json, os, sys
+cfg = os.path.expanduser('~/.claude-pulse/config.json')
+with open(cfg) as f:
+    d = json.load(f)
+
+ttype = os.environ['TRIGGER_TYPE']
+ttime = os.environ['TRIGGER_TIME']
+tdate = os.environ.get('TRIGGER_DATE', '')
+tasks = []
+if ttype == 'recurring':
+    for tr in d.get('recurring_triggers', []):
+        if tr['time'] == ttime:
+            tasks = tr.get('tasks', [{'mode': 'pulse'}])
+            break
+elif ttype == 'onetime':
+    for tr in d.get('onetime_triggers', []):
+        if tr['date'] == tdate and tr['time'] == ttime:
+            tasks = tr.get('tasks', [{'mode': 'pulse'}])
+            break
+
+if not tasks:
+    tasks = [{'mode': 'pulse'}]
+
+for t in tasks:
+    print(json.dumps(t))
+") || { log "ERROR: Failed to read tasks from config"; TASKS_JSON='{"mode":"pulse"}'; }
+fi
+
+run_task() {
+    local idx="$1" total="$2" task_json="$3"
+    local mode
+    mode=$(echo "$task_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('mode','pulse'))")
+
     local t0 t1 out ec
     t0=$(date +%s)
-    out=$("$CLAUDE_PATH" -p "reply with only the word: pulse" --max-turns 1 2>&1) || true
-    ec=$?
-    t1=$(date +%s)
-    if [[ $ec -eq 0 ]] && echo "$out" | grep -qi "pulse"; then
-        log "SUCCESS: $((t1-t0))s"; return 0
+
+    if [[ "$mode" == "pulse" ]]; then
+        cd "$DEFAULT_WORK_DIR" || { log "Task $idx/$total [pulse] FAIL: cd failed"; return 1; }
+        out=$("$CLAUDE_PATH" -p "reply with only the word: pulse" --max-turns 1 2>&1) || true
+        ec=$?
+        t1=$(date +%s)
+        if [[ $ec -eq 0 ]] && echo "$out" | grep -qi "pulse"; then
+            log "Task $idx/$total [pulse] SUCCESS: $((t1-t0))s"
+            return 0
+        fi
+        log "Task $idx/$total [pulse] FAIL: exit=$ec dur=$((t1-t0))s out=$(echo "$out" | head -3 | tr '\n' ' ')"
+        # Retry for pulse tasks only
+        log "Task $idx/$total [pulse] Retrying in 30s..."
+        sleep 30
+        t0=$(date +%s)
+        out=$("$CLAUDE_PATH" -p "reply with only the word: pulse" --max-turns 1 2>&1) || true
+        ec=$?
+        t1=$(date +%s)
+        if [[ $ec -eq 0 ]] && echo "$out" | grep -qi "pulse"; then
+            log "Task $idx/$total [pulse] SUCCESS (retry): $((t1-t0))s"
+            return 0
+        fi
+        log "Task $idx/$total [pulse] FAIL (retry): exit=$ec dur=$((t1-t0))s"
+        return 1
+
+    elif [[ "$mode" == "prompt" ]]; then
+        local prompt max_turns work_dir
+        prompt=$(echo "$task_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('prompt',''))")
+        max_turns=$(echo "$task_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('max_turns',5))")
+        work_dir=$(echo "$task_json" | python3 -c "import json,sys,os; print(os.path.expanduser(json.load(sys.stdin).get('work_directory','')))")
+        [[ -z "$work_dir" ]] && work_dir="$DEFAULT_WORK_DIR"
+
+        cd "$work_dir" || { log "Task $idx/$total [prompt] FAIL: cd $work_dir failed"; return 1; }
+
+        # Pass prompt safely via env var
+        out=$(CLAUDE_TASK_PROMPT="$prompt" "$CLAUDE_PATH" -p "$prompt" --max-turns "$max_turns" 2>&1) || true
+        ec=$?
+        t1=$(date +%s)
+
+        local prompt_short="${prompt:0:50}"
+        if [[ $ec -eq 0 ]]; then
+            log "Task $idx/$total [prompt] SUCCESS: $((t1-t0))s \"$prompt_short\""
+            return 0
+        fi
+        log "Task $idx/$total [prompt] FAIL: exit=$ec dur=$((t1-t0))s \"$prompt_short\""
+        return 1
+
+    else
+        log "Task $idx/$total [unknown:$mode] SKIP"
+        return 1
     fi
-    log "FAIL: exit=$ec dur=$((t1-t0))s out=$(echo "$out" | head -3 | tr '\n' ' ')"
-    return 1
 }
 
-run_pulse || { log "WARN: Retry 30s"; sleep 30; run_pulse || log "ERROR: Both failed"; }
+# Count tasks
+task_count=0
+while IFS= read -r _line; do
+    [[ -n "$_line" ]] && ((task_count++)) || true
+done <<< "$TASKS_JSON"
+[[ $task_count -eq 0 ]] && task_count=1
+
+# Execute tasks in parallel
+pids=()
+idx=0
+while IFS= read -r task_json; do
+    [[ -z "$task_json" ]] && continue
+    ((idx++)) || true
+    run_task "$idx" "$task_count" "$task_json" &
+    pids+=($!)
+done <<< "$TASKS_JSON"
+
+failed=0
+succeeded=0
+if ((${#pids[@]} > 0)); then
+    for pid in "${pids[@]}"; do
+        wait "$pid" && ((succeeded++)) || ((failed++))
+    done
+fi
+
+log "Trigger finished: $succeeded succeeded, $failed failed out of $task_count tasks"
 
 # Clean expired one-time triggers
 python3 << 'PYEOF' 2>/dev/null || true
@@ -381,7 +595,6 @@ PYEOF
 
 # Clean old logs
 find "$LOG_DIR" -name "pulse-*.log" -mtime +30 -delete 2>/dev/null || true
-log "Trigger finished"
 TRIGGEREOF
     chmod +x "$TRIGGER_SCRIPT"
 }
@@ -390,6 +603,16 @@ TRIGGEREOF
 
 _plist_body() {
     local label="$1" cal_interval="$2" claude_bin_dir="$3"
+    local trigger_type="${4:-}" trigger_time="${5:-}" trigger_date="${6:-}"
+
+    # Build extra ProgramArguments for trigger.sh
+    local extra_prog_args=""
+    if [[ -n "$trigger_type" ]]; then
+        extra_prog_args+=$'\n        <string>'"${trigger_type}"'</string>'
+        extra_prog_args+=$'\n        <string>'"${trigger_time}"'</string>'
+        [[ -n "$trigger_date" ]] && extra_prog_args+=$'\n        <string>'"${trigger_date}"'</string>'
+    fi
+
     cat << PEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -401,7 +624,7 @@ _plist_body() {
     <array>
         <string>/usr/bin/caffeinate</string>
         <string>-i</string>
-        <string>${TRIGGER_SCRIPT}</string>
+        <string>${TRIGGER_SCRIPT}</string>${extra_prog_args}
     </array>
     <key>StartCalendarInterval</key>
     ${cal_interval}
@@ -440,7 +663,7 @@ generate_recurring_plist() {
         <integer>${minute}</integer>
     </dict>"
 
-    _plist_body "$label" "$cal" "$(dirname "$claude_path")" > "$pf"
+    _plist_body "$label" "$cal" "$(dirname "$claude_path")" "recurring" "$time_str" > "$pf"
     echo "$pf"
 }
 
@@ -470,7 +693,7 @@ generate_onetime_plist() {
         <integer>${minute}</integer>
     </dict>"
 
-    _plist_body "$label" "$cal" "$(dirname "$claude_path")" > "$pf"
+    _plist_body "$label" "$cal" "$(dirname "$claude_path")" "onetime" "$time_str" "$date_str" > "$pf"
     echo "$pf"
 }
 
@@ -556,45 +779,83 @@ cmd_setup() {
     ver=$("$claude_path" --version 2>&1 | head -1) || true
     success "Found Claude CLI: $ver at $claude_path"
 
-    # Load existing triggers from config (if any)
-    local -a rec_times=()
-    local -a ot_triggers=()   # each element: "YYYY-MM-DD HH:MM"
+    # Migrate config if needed
+    migrate_config_if_needed
+
+    # Load existing triggers from config (v2 format)
+    local triggers_json="[]"
+    local ot_json="[]"
 
     if [[ -f "$CONFIG_FILE" ]]; then
-        local _existing
-        _existing=$(python3 << 'PYEOF'
+        local _loaded
+        _loaded=$(python3 << 'PYEOF'
 import json, os
 cfg = os.path.expanduser("~/.claude-pulse/config.json")
 with open(cfg) as f: d = json.load(f)
-for t in d.get("recurring_times", []):
-    print("REC " + t)
-for t in d.get("onetime_triggers", []):
-    print("OT " + t["date"] + " " + t["time"])
+print(json.dumps(d.get("recurring_triggers", [])))
+print(json.dumps(d.get("onetime_triggers", [])))
 PYEOF
         ) || true
-        while IFS= read -r line; do
-            case "$line" in
-                REC\ *) rec_times+=("${line#REC }") ;;
-                OT\ *)  ot_triggers+=("${line#OT }") ;;
-            esac
-        done <<< "$_existing"
-        if ((${#rec_times[@]} > 0 || ${#ot_triggers[@]} > 0)); then
-            info "Loaded existing triggers from config"
+        if [[ -n "$_loaded" ]]; then
+            triggers_json=$(echo "$_loaded" | head -1)
+            ot_json=$(echo "$_loaded" | tail -1)
+            local _count
+            _count=$(RECURRING="$triggers_json" ONETIME="$ot_json" python3 -c "
+import json, os
+r = json.loads(os.environ['RECURRING'])
+o = json.loads(os.environ['ONETIME'])
+print(len(r) + len(o))
+") || true
+            if [[ "$_count" -gt 0 ]] 2>/dev/null; then
+                info "Loaded existing triggers from config"
+            fi
         fi
     fi
 
     while true; do
-        # Show current triggers
-        if ((${#rec_times[@]} > 0 || ${#ot_triggers[@]} > 0)); then
-            echo ""
-            echo -e "  ${BLUE}Configured triggers:${NC}"
-            ((${#rec_times[@]} > 0)) && echo -e "    Daily:    ${GREEN}${rec_times[*]}${NC}"
-            if ((${#ot_triggers[@]} > 0)); then
-                for ot in "${ot_triggers[@]}"; do
-                    echo -e "    One-time: ${GREEN}${ot}${NC}"
-                done
-            fi
-        fi
+        # Display configured triggers with per-task detail
+        local _display
+        _display=$(RECURRING="$triggers_json" ONETIME="$ot_json" python3 -c "
+import json, os
+r = json.loads(os.environ['RECURRING'])
+o = json.loads(os.environ['ONETIME'])
+if not r and not o:
+    exit(0)
+print()
+print('  \033[0;34mConfigured triggers:\033[0m')
+for tr in r:
+    t = tr['time']
+    tasks = tr.get('tasks', [{'mode': 'pulse'}])
+    print(f'    Daily {t}:')
+    for task in tasks:
+        if task['mode'] == 'pulse':
+            print(f'      - pulse')
+        elif task['mode'] == 'prompt':
+            p = task['prompt']
+            if len(p) > 50: p = p[:50] + '...'
+            mt = task.get('max_turns', 5)
+            wd = task.get('work_directory', '')
+            line = f'      - prompt: \"{p}\" ({mt} turns)'
+            if wd: line += f' [{wd}]'
+            print(line)
+for tr in o:
+    d = tr['date']
+    t = tr['time']
+    tasks = tr.get('tasks', [{'mode': 'pulse'}])
+    print(f'    One-time {d} {t}:')
+    for task in tasks:
+        if task['mode'] == 'pulse':
+            print(f'      - pulse')
+        elif task['mode'] == 'prompt':
+            p = task['prompt']
+            if len(p) > 50: p = p[:50] + '...'
+            mt = task.get('max_turns', 5)
+            wd = task.get('work_directory', '')
+            line = f'      - prompt: \"{p}\" ({mt} turns)'
+            if wd: line += f' [{wd}]'
+            print(line)
+" 2>/dev/null) || true
+        [[ -n "$_display" ]] && echo "$_display"
 
         ui_menu "What would you like to do?" \
             "Add recurring daily triggers" \
@@ -604,14 +865,63 @@ PYEOF
 
         case $UI_MENU_RESULT in
             0)  # Recurring
-                if ((${#rec_times[@]} > 0)); then
-                    ui_time_grid "multi" "" "${rec_times[@]}"
+                # Get existing recurring times for pre-selection
+                local -a _existing_times=()
+                local _etimes
+                _etimes=$(echo "$triggers_json" | python3 -c "
+import json, sys
+for t in json.load(sys.stdin):
+    print(t['time'])
+" 2>/dev/null) || true
+                if [[ -n "$_etimes" ]]; then
+                    while IFS= read -r _t; do
+                        [[ -n "$_t" ]] && _existing_times+=("$_t")
+                    done <<< "$_etimes"
+                fi
+
+                if ((${#_existing_times[@]} > 0)); then
+                    ui_time_grid "multi" "" "${_existing_times[@]}"
                 else
                     ui_time_grid "multi" ""
                 fi
+
                 if [[ -n "$UI_GRID_RESULT" ]]; then
-                    rec_times=($UI_GRID_RESULT)
-                    success "Daily triggers: ${rec_times[*]}"
+                    local -a new_times=($UI_GRID_RESULT)
+                    local new_triggers_json="[]"
+
+                    for nt in "${new_times[@]}"; do
+                        # Check if this time existed before — preserve its tasks
+                        local _existing_tasks
+                        _existing_tasks=$(TRIGGERS="$triggers_json" TIME="$nt" python3 -c "
+import json, os
+triggers = json.loads(os.environ['TRIGGERS'])
+t = os.environ['TIME']
+for tr in triggers:
+    if tr['time'] == t:
+        print(json.dumps(tr['tasks']))
+        break
+" 2>/dev/null) || true
+
+                        if [[ -n "$_existing_tasks" ]]; then
+                            new_triggers_json=$(TRIGGERS="$new_triggers_json" TIME="$nt" TASKS="$_existing_tasks" python3 -c "
+import json, os
+triggers = json.loads(os.environ['TRIGGERS'])
+triggers.append({'time': os.environ['TIME'], 'tasks': json.loads(os.environ['TASKS'])})
+print(json.dumps(triggers))
+")
+                        else
+                            # New time — configure tasks
+                            ui_configure_tasks "$nt"
+                            new_triggers_json=$(TRIGGERS="$new_triggers_json" TIME="$nt" TASKS="$UI_TASKS_RESULT" python3 -c "
+import json, os
+triggers = json.loads(os.environ['TRIGGERS'])
+triggers.append({'time': os.environ['TIME'], 'tasks': json.loads(os.environ['TASKS'])})
+print(json.dumps(triggers))
+")
+                        fi
+                    done
+                    triggers_json="$new_triggers_json"
+                    success "Daily triggers updated"
                 fi
                 ;;
             1)  # One-time
@@ -620,14 +930,21 @@ PYEOF
                     local chosen_date="$UI_DATE_RESULT"
                     ui_time_grid "single" "$chosen_date"
                     if [[ -n "$UI_GRID_RESULT" ]]; then
-                        ot_triggers+=("$chosen_date $UI_GRID_RESULT")
-                        success "Added: $chosen_date $UI_GRID_RESULT"
+                        local chosen_time="$UI_GRID_RESULT"
+                        ui_configure_tasks "$chosen_time"
+                        ot_json=$(OT="$ot_json" DATE="$chosen_date" TIME="$chosen_time" TASKS="$UI_TASKS_RESULT" python3 -c "
+import json, os
+ot = json.loads(os.environ['OT'])
+ot.append({'date': os.environ['DATE'], 'time': os.environ['TIME'], 'tasks': json.loads(os.environ['TASKS'])})
+print(json.dumps(ot))
+")
+                        success "Added: $chosen_date $chosen_time"
                     fi
                 fi
                 ;;
             2)  # Clear
-                rec_times=()
-                ot_triggers=()
+                triggers_json="[]"
+                ot_json="[]"
                 success "All triggers cleared"
                 ;;
             3)  # Apply
@@ -636,7 +953,15 @@ PYEOF
         esac
     done
 
-    if ((${#rec_times[@]} == 0 && ${#ot_triggers[@]} == 0)); then
+    # Check if any triggers configured
+    local _total
+    _total=$(RECURRING="$triggers_json" ONETIME="$ot_json" python3 -c "
+import json, os
+r = json.loads(os.environ['RECURRING'])
+o = json.loads(os.environ['ONETIME'])
+print(len(r) + len(o))
+") || true
+    if [[ "$_total" == "0" ]]; then
         warn "No triggers configured."
         exit 0
     fi
@@ -644,38 +969,22 @@ PYEOF
     # Create directories
     mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$LAUNCH_AGENTS_DIR"
 
-    # Build JSON arrays
-    local rec_json="[]"
-    if ((${#rec_times[@]} > 0)); then
-        rec_json=$(printf '"%s",' "${rec_times[@]}")
-        rec_json="[${rec_json%,}]"
-    fi
-
-    local ot_json="["
-    local ot_first=true
-    if ((${#ot_triggers[@]} > 0)); then
-        for ot in "${ot_triggers[@]}"; do
-            local d="${ot%% *}" t="${ot##* }"
-            [[ "$ot_first" == true ]] && ot_first=false || ot_json+=","
-            ot_json+="{\"date\":\"$d\",\"time\":\"$t\"}"
-        done
-    fi
-    ot_json+="]"
-
-    # Write config
-    python3 << PYEOF
-import json
+    # Write config (v2)
+    CLAUDE_PATH_VAL="$claude_path" HOME_DIR="$HOME" RECURRING="$triggers_json" ONETIME="$ot_json" python3 -c "
+import json, os
 config = {
-    "claude_path": "$claude_path",
-    "work_directory": "$HOME",
-    "enabled": True,
-    "recurring_times": $rec_json,
-    "onetime_triggers": $ot_json
+    'config_version': 2,
+    'claude_path': os.environ['CLAUDE_PATH_VAL'],
+    'work_directory': os.environ['HOME_DIR'],
+    'enabled': True,
+    'recurring_triggers': json.loads(os.environ['RECURRING']),
+    'onetime_triggers': json.loads(os.environ['ONETIME'])
 }
-with open("$CONFIG_FILE", "w") as f:
+cfg = os.path.expanduser('~/.claude-pulse/config.json')
+with open(cfg, 'w') as f:
     json.dump(config, f, indent=2)
-    f.write("\n")
-PYEOF
+    f.write('\n')
+"
     success "Config saved"
 
     # Generate trigger script
@@ -686,25 +995,46 @@ PYEOF
     unload_existing_plists
 
     local -a plist_files=()
-    if ((${#rec_times[@]} > 0)); then
-        for t in "${rec_times[@]}"; do
-            plist_files+=("$(generate_recurring_plist "$t" "$claude_path")")
-        done
+
+    # Recurring plists
+    local _rec_times
+    _rec_times=$(echo "$triggers_json" | python3 -c "
+import json, sys
+for tr in json.load(sys.stdin):
+    print(tr['time'])
+" 2>/dev/null) || true
+    if [[ -n "$_rec_times" ]]; then
+        while IFS= read -r t; do
+            [[ -n "$t" ]] && plist_files+=("$(generate_recurring_plist "$t" "$claude_path")")
+        done <<< "$_rec_times"
     fi
-    if ((${#ot_triggers[@]} > 0)); then
-        for ot in "${ot_triggers[@]}"; do
-            local d="${ot%% *}" t="${ot##* }"
+
+    # One-time plists
+    local _ot_info
+    _ot_info=$(echo "$ot_json" | python3 -c "
+import json, sys
+for tr in json.load(sys.stdin):
+    print(tr['date'] + ' ' + tr['time'])
+" 2>/dev/null) || true
+    if [[ -n "$_ot_info" ]]; then
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local d="${line%% *}" t="${line##* }"
             plist_files+=("$(generate_onetime_plist "$d" "$t" "$claude_path")")
-        done
+        done <<< "$_ot_info"
     fi
 
     # pmset for nighttime triggers
     local -a all_times=()
-    if ((${#rec_times[@]} > 0)); then
-        all_times=("${rec_times[@]}")
+    if [[ -n "$_rec_times" ]]; then
+        while IFS= read -r t; do
+            [[ -n "$t" ]] && all_times+=("$t")
+        done <<< "$_rec_times"
     fi
-    if ((${#ot_triggers[@]} > 0)); then
-        for ot in "${ot_triggers[@]}"; do all_times+=("${ot##* }"); done
+    if [[ -n "$_ot_info" ]]; then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && all_times+=("${line##* }")
+        done <<< "$_ot_info"
     fi
     ((${#all_times[@]} > 0)) && setup_pmset_wake "${all_times[@]}" || true
 
@@ -742,10 +1072,11 @@ cmd_status() {
         exit 0
     fi
 
-    local enabled claude_path rec_times
+    migrate_config_if_needed
+
+    local enabled claude_path
     enabled=$(json_get "$CONFIG_FILE" "enabled")
     claude_path=$(json_get "$CONFIG_FILE" "claude_path")
-    rec_times=$(json_get_array "$CONFIG_FILE" "recurring_times")
 
     if [[ "$enabled" == "True" ]]; then
         echo -e "  Status:    ${GREEN}ENABLED${NC}"
@@ -753,17 +1084,37 @@ cmd_status() {
         echo -e "  Status:    ${RED}DISABLED${NC}"
     fi
     echo "  Claude:    $claude_path"
-    [[ -n "$rec_times" ]] && echo "  Daily:     $rec_times"
 
-    # One-time triggers
-    local ot_info
-    ot_info=$(python3 -c "
+    # Display triggers with tasks
+    local _trigger_display
+    _trigger_display=$(python3 -c "
 import json
 d = json.load(open('$CONFIG_FILE'))
-for t in d.get('onetime_triggers', []):
-    print(f\"  One-time:  {t['date']} {t['time']}\")
+for tr in d.get('recurring_triggers', []):
+    t = tr['time']
+    tasks = tr.get('tasks', [{'mode': 'pulse'}])
+    parts = []
+    for task in tasks:
+        if task['mode'] == 'pulse':
+            parts.append('pulse')
+        elif task['mode'] == 'prompt':
+            p = task['prompt']
+            if len(p) > 40: p = p[:40] + '...'
+            parts.append(f'prompt: \"{p}\" ({task.get(\"max_turns\", 5)}t)')
+    print(f'  Daily:     {t}  [{\"  |  \".join(parts)}]')
+for tr in d.get('onetime_triggers', []):
+    tasks = tr.get('tasks', [{'mode': 'pulse'}])
+    parts = []
+    for task in tasks:
+        if task['mode'] == 'pulse':
+            parts.append('pulse')
+        elif task['mode'] == 'prompt':
+            p = task['prompt']
+            if len(p) > 40: p = p[:40] + '...'
+            parts.append(f'prompt: \"{p}\" ({task.get(\"max_turns\", 5)}t)')
+    print(f'  One-time:  {tr[\"date\"]} {tr[\"time\"]}  [{\"  |  \".join(parts)}]')
 " 2>/dev/null) || true
-    [[ -n "$ot_info" ]] && echo "$ot_info"
+    [[ -n "$_trigger_display" ]] && echo "$_trigger_display"
 
     # Launch agents
     echo ""
@@ -805,6 +1156,7 @@ for t in d.get('onetime_triggers', []):
 cmd_start() {
     [[ -f "$CONFIG_FILE" ]] || { error "Run 'claude-pulse setup' first"; exit 1; }
 
+    migrate_config_if_needed
     json_set_bool "$CONFIG_FILE" "enabled" "True"
 
     local loaded
@@ -814,15 +1166,28 @@ cmd_start() {
     success "Started ($loaded agents)"
 
     # Re-apply pmset
-    local rec_times
-    rec_times=$(json_get_array "$CONFIG_FILE" "recurring_times")
-    local -a arr=($rec_times)
+    local -a arr=()
+    local _times
+    _times=$(python3 -c "
+import json
+d = json.load(open('$CONFIG_FILE'))
+for tr in d.get('recurring_triggers', []):
+    print(tr['time'])
+for tr in d.get('onetime_triggers', []):
+    print(tr['time'])
+" 2>/dev/null) || true
+    if [[ -n "$_times" ]]; then
+        while IFS= read -r t; do
+            [[ -n "$t" ]] && arr+=("$t")
+        done <<< "$_times"
+    fi
     ((${#arr[@]} > 0)) && setup_pmset_wake "${arr[@]}" || true
 }
 
 cmd_stop() {
     [[ -f "$CONFIG_FILE" ]] || { error "Run 'claude-pulse setup' first"; exit 1; }
 
+    migrate_config_if_needed
     json_set_bool "$CONFIG_FILE" "enabled" "False"
 
     local unloaded
@@ -860,17 +1225,23 @@ cmd_logs() {
 
 cmd_help() {
     cat << 'EOF'
-Claude Pulse - Auto-trigger Claude Code for token quota refresh
+Claude Pulse - Auto-trigger Claude Code for token quota refresh & task execution
 
 Usage: claude-pulse <command> [options]
 
 Commands:
-  setup     Interactive configuration (no typing required)
+  setup     Interactive configuration (triggers + tasks)
   start     Enable triggers
   stop      Disable triggers
-  status    Show state
+  status    Show state and configured tasks
   logs      Show trigger logs
   help      This message
+
+Task modes (configured during setup):
+  pulse     Minimal "pulse" to keep tokens fresh (default)
+  prompt    Custom prompt — Claude executes a real task
+
+Multiple tasks per trigger run in parallel.
 
 Log options:
   --today         Today's logs
