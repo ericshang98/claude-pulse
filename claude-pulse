@@ -821,39 +821,56 @@ r = json.loads(os.environ['RECURRING'])
 o = json.loads(os.environ['ONETIME'])
 if not r and not o:
     exit(0)
-print()
-print('  \033[0;34mConfigured triggers:\033[0m')
+
+lines = []
+lines.append('\033[0;34mConfigured triggers:\033[0m')
 for tr in r:
     t = tr['time']
     tasks = tr.get('tasks', [{'mode': 'pulse'}])
-    print(f'    Daily {t}:')
+    lines.append(f'  Daily {t}:')
     for task in tasks:
         if task['mode'] == 'pulse':
-            print(f'      - pulse')
+            lines.append(f'    - pulse')
         elif task['mode'] == 'prompt':
             p = task['prompt']
             if len(p) > 50: p = p[:50] + '...'
             mt = task.get('max_turns', 5)
             wd = task.get('work_directory', '')
-            line = f'      - prompt: \"{p}\" ({mt} turns)'
+            line = f'    - prompt: \"{p}\" ({mt} turns)'
             if wd: line += f' [{wd}]'
-            print(line)
+            lines.append(line)
 for tr in o:
     d = tr['date']
     t = tr['time']
     tasks = tr.get('tasks', [{'mode': 'pulse'}])
-    print(f'    One-time {d} {t}:')
+    lines.append(f'  One-time {d} {t}:')
     for task in tasks:
         if task['mode'] == 'pulse':
-            print(f'      - pulse')
+            lines.append(f'    - pulse')
         elif task['mode'] == 'prompt':
             p = task['prompt']
             if len(p) > 50: p = p[:50] + '...'
             mt = task.get('max_turns', 5)
             wd = task.get('work_directory', '')
-            line = f'      - prompt: \"{p}\" ({mt} turns)'
+            line = f'    - prompt: \"{p}\" ({mt} turns)'
             if wd: line += f' [{wd}]'
-            print(line)
+            lines.append(line)
+
+# Strip ANSI, count CJK as double-width for terminal alignment
+import re, unicodedata
+def visible_len(s):
+    s = re.sub(r'\033\[[0-9;]*m', '', s)
+    return sum(2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1 for c in s)
+
+w = max(visible_len(l) for l in lines) + 2
+DIM = '\033[2m'
+RST = '\033[0m'
+print()
+print(f'  {DIM}┌{\"─\" * (w + 2)}┐{RST}')
+for l in lines:
+    pad = w - visible_len(l)
+    print(f'  {DIM}│{RST} {l}{\" \" * pad} {DIM}│{RST}')
+print(f'  {DIM}└{\"─\" * (w + 2)}┘{RST}')
 " 2>/dev/null) || true
         [[ -n "$_display" ]] && echo "$_display"
 
