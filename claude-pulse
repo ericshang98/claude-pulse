@@ -21,9 +21,14 @@ DIM='\033[2m'
 REV='\033[7m'
 NC='\033[0m'
 
-_cleanup_term() { tput cnorm 2>/dev/null || true; }
+_cleanup_term() {
+    tput cnorm 2>/dev/null || true
+    stty ixon 2>/dev/null || true
+}
 trap _cleanup_term EXIT
 trap 'echo ""; exit 130' INT TERM
+# Allow Ctrl+Q to pass through (disable XON/XOFF flow control)
+stty -ixon 2>/dev/null || true
 
 info()    { echo -e "${BLUE}[info]${NC} $*"; }
 success() { echo -e "${GREEN}[ok]${NC} $*"; }
@@ -109,10 +114,12 @@ ui_menu() {
             fi
         done
         printf '\n'
-        printf '  \033[2m↑↓ move  Enter select  Esc/q back\033[0m\033[K'
+        printf '  \033[2m↑↓ move  Enter select  Esc back  Ctrl-Q quit\033[0m\033[K'
 
         IFS= read -rsn1 key
         case "$key" in
+            $'\x11') # Ctrl+Q — exit program
+                printf '\n'; tput cnorm; echo ""; exit 0 ;;
             $'\e') read -rsn2 -t 1 key
                 case "$key" in
                     '[A') ((sel > 0)) && ((sel--)) || true ;;
@@ -204,9 +211,9 @@ print(d.strftime('%w'), d.strftime('%m/%d'), nd.strftime('%w'), nd.strftime('%m/
 
         printf '\n'
         if [[ "$mode" == "multi" ]]; then
-            printf '  \033[1mSelect times\033[0m  \033[2mSpace toggle  Enter confirm  Esc/q back\033[0m\n'
+            printf '  \033[1mSelect times\033[0m  \033[2mSpace toggle  Enter confirm  Esc back  Ctrl-Q quit\033[0m\n'
         else
-            printf '  \033[1mSelect time\033[0m  \033[2mEnter/Space select  Esc/q back\033[0m\n'
+            printf '  \033[1mSelect time\033[0m  \033[2mEnter/Space select  Esc back  Ctrl-Q quit\033[0m\n'
         fi
         printf '\n'
 
@@ -275,10 +282,12 @@ print(d.strftime('%w'), d.strftime('%m/%d'), nd.strftime('%w'), nd.strftime('%m/
         printf '\n'
         printf '  \033[33m%s\033[0m\033[K\n' "$info"
         printf '\n'
-        printf '  \033[2m←→↑↓ navigate  Esc/q back\033[0m\033[K'
+        printf '  \033[2m←→↑↓ navigate  Esc back  Ctrl-Q quit\033[0m\033[K'
 
         IFS= read -rsn1 key
         case "$key" in
+            $'\x11') # Ctrl+Q — exit program
+                printf '\n'; tput cnorm; echo ""; exit 0 ;;
             $'\e') read -rsn2 -t 1 key
                 case "$key" in
                     '[A') ((cr > 0)) && ((cr--)) || true ;;
@@ -343,7 +352,7 @@ ui_date_selector() {
         [[ "$first" == true ]] && first=false || printf "\033[%dA\r" "$draw"
 
         printf '\n'
-        printf '  \033[1mSelect date\033[0m  \033[2m↑↓ move  Enter select  Esc/q back\033[0m\n'
+        printf '  \033[1mSelect date\033[0m  \033[2m↑↓ move  Enter select  Esc back  Ctrl-Q quit\033[0m\n'
         printf '\n'
         for i in "${!labels[@]}"; do
             local _color=""
@@ -361,6 +370,8 @@ ui_date_selector() {
 
         IFS= read -rsn1 key
         case "$key" in
+            $'\x11') # Ctrl+Q — exit program
+                printf '\n'; tput cnorm; echo ""; exit 0 ;;
             $'\e') read -rsn2 -t 1 key
                 case "$key" in
                     '[A') ((sel > 0)) && ((sel--)) || true ;;
