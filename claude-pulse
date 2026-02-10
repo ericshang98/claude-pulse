@@ -397,7 +397,8 @@ ui_configure_tasks() {
     while true; do
         ui_menu "Task for $time_str:" \
             "Pulse (token refresh)" \
-            "Custom prompt (Claude executes a task)"
+            "Custom prompt (Claude executes a task)" \
+            "Auto (Claude plans and executes)"
 
         case $UI_MENU_RESULT in
             -1) # ESC/q — cancel, default to pulse
@@ -459,6 +460,71 @@ tasks.append(task)
 print(json.dumps(tasks))
 ")
                 success "Added prompt task"
+                ;;
+            2)  # Auto mode
+                tput cnorm
+                echo ""
+                echo -e "  ${BOLD}Describe the work for Claude:${NC}"
+                echo -e "  ${DIM}(or @filepath to load from file)${NC}"
+                echo -n "  > "
+                local auto_input=""
+                IFS= read -r auto_input
+
+                if [[ -z "$auto_input" ]]; then
+                    warn "Empty input, skipping"
+                    continue
+                fi
+
+                # Handle @filepath
+                if [[ "$auto_input" == @* ]]; then
+                    local fpath="${auto_input#@}"
+                    fpath="${fpath## }"  # trim leading space
+                    # Expand ~ to HOME
+                    fpath="${fpath/#\~/$HOME}"
+                    if [[ -f "$fpath" ]]; then
+                        auto_input=$(cat "$fpath")
+                        local char_count=${#auto_input}
+                        success "Loaded from $fpath ($char_count chars)"
+                    else
+                        error "File not found: $fpath"
+                        continue
+                    fi
+                fi
+
+                # Scale preset
+                ui_menu "Scale:" \
+                    "Standard — 5 workers, 10 turns each (Recommended)" \
+                    "Light — 3 workers, 5 turns each" \
+                    "Heavy — 10 workers, 20 turns each"
+                local auto_scale="standard"
+                case $UI_MENU_RESULT in
+                    0) auto_scale="standard" ;;
+                    1) auto_scale="light" ;;
+                    2) auto_scale="heavy" ;;
+                esac
+
+                # Work directory
+                ui_menu "Work directory:" "Default (~)" "Custom path"
+                local auto_work_dir=""
+                if [[ $UI_MENU_RESULT -eq 1 ]]; then
+                    tput cnorm
+                    echo ""
+                    echo -n "  Path: "
+                    IFS= read -r auto_work_dir
+                fi
+
+                # Build task JSON
+                tasks_json=$(AUTO_INPUT="$auto_input" AUTO_SCALE="$auto_scale" AUTO_WORK_DIR="$auto_work_dir" TASKS="$tasks_json" python3 -c "
+import json, os
+tasks = json.loads(os.environ['TASKS'])
+task = {'mode': 'auto', 'input': os.environ['AUTO_INPUT'], 'scale': os.environ['AUTO_SCALE']}
+wd = os.environ['AUTO_WORK_DIR']
+if wd:
+    task['work_directory'] = wd
+tasks.append(task)
+print(json.dumps(tasks))
+")
+                success "Added auto task ($auto_scale)"
                 ;;
         esac
 
@@ -541,6 +607,64 @@ for t in tasks:
 ") || { log "ERROR: Failed to read tasks from config"; TASKS_JSON='{"mode":"pulse"}'; }
 fi
 
+scale_params() {
+    case "$1" in
+        light)    echo "3 5" ;;
+        standard) echo "5 10" ;;
+        heavy)    echo "10 20" ;;
+        *)        echo "5 10" ;;
+    esac
+}
+
+build_orchestrator_prompt() {
+    local user_input="$1" work_dir="$2" max_workers="$3"
+    cat << ORCHEOF
+You are a project orchestrator. Analyze the project and break down the user's request into independent sub-tasks.
+
+Working directory: $work_dir
+
+User's request:
+$user_input
+
+Instructions:
+1. Briefly analyze the project structure (look at key files, git status, directory layout)
+2. Decompose the user's request into at most $max_workers independent sub-tasks
+3. Each sub-task should be completable by a single Claude Code session working in isolation
+4. Tasks should NOT depend on each other's output — they run in parallel
+
+Output ONLY a valid JSON object (no markdown, no explanation) in this exact format:
+{"analysis": "brief project analysis", "tasks": [{"id": "01", "name": "short-task-name", "prompt": "detailed prompt for this sub-task"}]}
+
+Keep task names short (2-4 words, lowercase, hyphens). Make prompts detailed and self-contained.
+ORCHEOF
+}
+
+run_auto_worker() {
+    local wid="$1" wname="$2" wprompt="$3" work_dir="$4" max_turns="$5" job_dir="$6"
+    local wfile="$job_dir/workers/${wid}-${wname}.md"
+    local wt0 wt1 wec
+
+    log "  Worker $wid ($wname) started"
+    wt0=$(date +%s)
+
+    cd "$work_dir" || { log "  Worker $wid FAIL: cd failed"; echo "ERROR: cd $work_dir failed" > "$wfile"; return 1; }
+
+    WORKER_PROMPT="$wprompt" "$CLAUDE_PATH" -p "$wprompt" \
+        --max-turns "$max_turns" \
+        --no-session-persistence \
+        > "$wfile" 2>&1 || true
+    wec=$?
+    wt1=$(date +%s)
+
+    if [[ $wec -eq 0 ]]; then
+        log "  Worker $wid ($wname) SUCCESS: $((wt1-wt0))s"
+        return 0
+    else
+        log "  Worker $wid ($wname) FAIL: exit=$wec dur=$((wt1-wt0))s"
+        return 1
+    fi
+}
+
 run_task() {
     local idx="$1" total="$2" task_json="$3"
     local mode
@@ -594,6 +718,211 @@ run_task() {
         fi
         log "Task $idx/$total [prompt] FAIL: exit=$ec dur=$((t1-t0))s \"$prompt_short\""
         return 1
+
+    elif [[ "$mode" == "auto" ]]; then
+        local auto_input auto_scale work_dir
+        auto_input=$(echo "$task_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('input',''))")
+        auto_scale=$(echo "$task_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('scale','standard'))")
+        work_dir=$(echo "$task_json" | python3 -c "import json,sys,os; print(os.path.expanduser(json.load(sys.stdin).get('work_directory','')))")
+        [[ -z "$work_dir" ]] && work_dir="$DEFAULT_WORK_DIR"
+
+        local params max_workers max_worker_turns
+        params=$(scale_params "$auto_scale")
+        max_workers=${params%% *}
+        max_worker_turns=${params##* }
+
+        # Create job directory
+        local job_id job_dir
+        job_id="$(date +%Y%m%d-%H%M)-$(printf '%04x' $RANDOM)"
+        job_dir="$CONFIG_DIR/jobs/$job_id"
+        mkdir -p "$job_dir/workers"
+
+        log "Task $idx/$total [auto] START: scale=$auto_scale workers=$max_workers turns=$max_worker_turns job=$job_id"
+
+        # Save input
+        echo "$auto_input" > "$job_dir/input.md"
+
+        # Write initial meta.json
+        JOB_ID="$job_id" SCALE="$auto_scale" MW="$max_workers" MWT="$max_worker_turns" INPUT="$auto_input" WDIR="$work_dir" python3 -c "
+import json, os
+from datetime import datetime
+meta = {
+    'job_id': os.environ['JOB_ID'],
+    'status': 'running',
+    'started': datetime.now().isoformat(),
+    'scale': os.environ['SCALE'],
+    'max_workers': int(os.environ['MW']),
+    'max_worker_turns': int(os.environ['MWT']),
+    'work_directory': os.environ['WDIR'],
+    'input_preview': os.environ['INPUT'][:100]
+}
+jdir = os.path.expanduser('~/.claude-pulse/jobs/' + os.environ['JOB_ID'])
+with open(os.path.join(jdir, 'meta.json'), 'w') as f:
+    json.dump(meta, f, indent=2); f.write('\n')
+"
+
+        # Phase 1: Orchestrator
+        log "Task $idx/$total [auto] Phase 1: Orchestrator"
+        local orch_prompt
+        orch_prompt=$(build_orchestrator_prompt "$auto_input" "$work_dir" "$max_workers")
+
+        cd "$work_dir" || { log "Task $idx/$total [auto] FAIL: cd $work_dir failed"; return 1; }
+
+        local orch_out
+        orch_out=$(ORCH_PROMPT="$orch_prompt" "$CLAUDE_PATH" -p "$orch_prompt" \
+            --max-turns 5 \
+            --output-format json \
+            --no-session-persistence \
+            2>&1) || true
+
+        # Extract the result text from JSON output
+        local orch_result
+        orch_result=$(echo "$orch_out" | python3 -c "
+import json, sys, re
+raw = sys.stdin.read()
+# Try to parse as Claude JSON output format
+try:
+    data = json.loads(raw)
+    # Claude --output-format json wraps result in {result: ...}
+    text = data.get('result', raw)
+except:
+    text = raw
+
+# Extract JSON object from text (may have surrounding text)
+match = re.search(r'\{[\s\S]*\"tasks\"[\s\S]*\}', text)
+if match:
+    print(match.group(0))
+else:
+    print(text)
+" 2>/dev/null) || orch_result="$orch_out"
+
+        # Parse plan
+        local plan_valid
+        plan_valid=$(echo "$orch_result" | python3 -c "
+import json, sys
+try:
+    plan = json.loads(sys.stdin.read())
+    tasks = plan.get('tasks', [])
+    if tasks and all('id' in t and 'prompt' in t for t in tasks):
+        print('ok')
+    else:
+        print('fail')
+except:
+    print('fail')
+" 2>/dev/null) || plan_valid="fail"
+
+        if [[ "$plan_valid" != "ok" ]]; then
+            log "Task $idx/$total [auto] FAIL: Orchestrator did not produce valid plan"
+            echo "$orch_result" > "$job_dir/plan.json"
+            # Update meta
+            JOB_ID="$job_id" python3 -c "
+import json, os
+from datetime import datetime
+jdir = os.path.expanduser('~/.claude-pulse/jobs/' + os.environ['JOB_ID'])
+mf = os.path.join(jdir, 'meta.json')
+with open(mf) as f: meta = json.load(f)
+meta['status'] = 'failed'
+meta['finished'] = datetime.now().isoformat()
+meta['error'] = 'orchestrator_invalid_plan'
+with open(mf, 'w') as f: json.dump(meta, f, indent=2); f.write('\n')
+"
+            return 1
+        fi
+
+        echo "$orch_result" > "$job_dir/plan.json"
+        local task_count_auto
+        task_count_auto=$(echo "$orch_result" | python3 -c "import json,sys; print(len(json.loads(sys.stdin.read())['tasks']))")
+        log "Task $idx/$total [auto] Orchestrator produced $task_count_auto sub-tasks"
+
+        # Phase 2: Workers (parallel)
+        log "Task $idx/$total [auto] Phase 2: Workers ($task_count_auto tasks)"
+        local -a worker_pids=()
+        local worker_lines
+        worker_lines=$(echo "$orch_result" | python3 -c "
+import json, sys
+plan = json.loads(sys.stdin.read())
+for t in plan['tasks']:
+    # Use tab as delimiter to avoid quoting issues
+    name = t.get('name', 'task').replace(' ', '-')[:30]
+    print(t['id'] + '\t' + name + '\t' + t['prompt'])
+")
+
+        while IFS=$'\t' read -r wid wname wprompt; do
+            [[ -z "$wid" ]] && continue
+            run_auto_worker "$wid" "$wname" "$wprompt" "$work_dir" "$max_worker_turns" "$job_dir" &
+            worker_pids+=($!)
+        done <<< "$worker_lines"
+
+        local w_succeeded=0 w_failed=0
+        if ((${#worker_pids[@]} > 0)); then
+            for wpid in "${worker_pids[@]}"; do
+                wait "$wpid" && ((w_succeeded++)) || ((w_failed++))
+            done
+        fi
+        log "Task $idx/$total [auto] Workers done: $w_succeeded succeeded, $w_failed failed"
+
+        # Phase 3: Summarizer
+        log "Task $idx/$total [auto] Phase 3: Summarizer"
+        local worker_outputs=""
+        for wf in "$job_dir"/workers/*.md; do
+            [[ -f "$wf" ]] || continue
+            local wfname
+            wfname=$(basename "$wf")
+            worker_outputs+="
+--- Worker: $wfname ---
+$(cat "$wf")
+--- End: $wfname ---
+"
+        done
+
+        local summary_prompt
+        summary_prompt="You are a summarizer. Read the original request, the plan, and all worker outputs below, then write a structured Markdown summary report.
+
+Original request:
+$(cat "$job_dir/input.md")
+
+Plan:
+$(cat "$job_dir/plan.json")
+
+Worker outputs:
+$worker_outputs
+
+Write a clear Markdown report with:
+1. **Overview** — what was requested and overall result
+2. **Tasks completed** — summary of each worker's output
+3. **Issues** — any failures or concerns
+4. **Next steps** — suggested follow-up actions if any
+
+Be concise but thorough."
+
+        local summary_out
+        cd "$work_dir" || true
+        summary_out=$(SUMMARY_PROMPT="$summary_prompt" "$CLAUDE_PATH" -p "$summary_prompt" \
+            --max-turns 1 \
+            --no-session-persistence \
+            2>&1) || true
+        echo "$summary_out" > "$job_dir/summary.md"
+
+        t1=$(date +%s)
+
+        # Update meta.json
+        JOB_ID="$job_id" DURATION="$((t1-t0))" TASK_COUNT="$task_count_auto" W_OK="$w_succeeded" W_FAIL="$w_failed" python3 -c "
+import json, os
+from datetime import datetime
+jdir = os.path.expanduser('~/.claude-pulse/jobs/' + os.environ['JOB_ID'])
+mf = os.path.join(jdir, 'meta.json')
+with open(mf) as f: meta = json.load(f)
+meta['status'] = 'completed'
+meta['finished'] = datetime.now().isoformat()
+meta['duration_seconds'] = int(os.environ['DURATION'])
+meta['task_count'] = int(os.environ['TASK_COUNT'])
+meta['workers_succeeded'] = int(os.environ['W_OK'])
+meta['workers_failed'] = int(os.environ['W_FAIL'])
+with open(mf, 'w') as f: json.dump(meta, f, indent=2); f.write('\n')
+"
+
+        log "Task $idx/$total [auto] COMPLETED: $((t1-t0))s, $w_succeeded/$task_count_auto workers succeeded, job=$job_id"
+        return 0
 
     else
         log "Task $idx/$total [unknown:$mode] SKIP"
@@ -655,6 +984,11 @@ PYEOF
 
 # Clean old logs
 find "$LOG_DIR" -name "pulse-*.log" -mtime +30 -delete 2>/dev/null || true
+
+# Clean old jobs (30-day retention)
+if [[ -d "$CONFIG_DIR/jobs" ]]; then
+    find "$CONFIG_DIR/jobs" -mindepth 1 -maxdepth 1 -type d -mtime +30 -exec rm -rf {} \; 2>/dev/null || true
+fi
 TRIGGEREOF
     chmod +x "$TRIGGER_SCRIPT"
 }
@@ -907,6 +1241,14 @@ for tr in r:
             line = f'    - prompt: \"{p}\" ({mt} turns)'
             if wd: line += f' [{wd}]'
             lines.append(line)
+        elif task['mode'] == 'auto':
+            inp = task.get('input', '')
+            if len(inp) > 50: inp = inp[:50] + '...'
+            s = task.get('scale', 'standard')
+            wd = task.get('work_directory', '')
+            line = f'    - auto: \"{inp}\" ({s})'
+            if wd: line += f' [{wd}]'
+            lines.append(line)
 for tr in o:
     d = tr['date']
     t = tr['time']
@@ -930,6 +1272,14 @@ for tr in o:
             mt = task.get('max_turns', 5)
             wd = task.get('work_directory', '')
             line = f'    - prompt: \"{p}\" ({mt} turns)'
+            if wd: line += f' [{wd}]'
+            lines.append(line)
+        elif task['mode'] == 'auto':
+            inp = task.get('input', '')
+            if len(inp) > 50: inp = inp[:50] + '...'
+            s = task.get('scale', 'standard')
+            wd = task.get('work_directory', '')
+            line = f'    - auto: \"{inp}\" ({s})'
             if wd: line += f' [{wd}]'
             lines.append(line)
 
@@ -1198,6 +1548,10 @@ for tr in d.get('recurring_triggers', []):
             p = task['prompt']
             if len(p) > 40: p = p[:40] + '...'
             parts.append(f'prompt: \"{p}\" ({task.get(\"max_turns\", 5)}t)')
+        elif task['mode'] == 'auto':
+            inp = task.get('input', '')
+            if len(inp) > 40: inp = inp[:40] + '...'
+            parts.append(f'auto: \"{inp}\" ({task.get(\"scale\", \"standard\")})')
     print(f'  Daily:     {t}  [{\"  |  \".join(parts)}]')
 for tr in d.get('onetime_triggers', []):
     tasks = tr.get('tasks', [{'mode': 'pulse'}])
@@ -1209,6 +1563,10 @@ for tr in d.get('onetime_triggers', []):
             p = task['prompt']
             if len(p) > 40: p = p[:40] + '...'
             parts.append(f'prompt: \"{p}\" ({task.get(\"max_turns\", 5)}t)')
+        elif task['mode'] == 'auto':
+            inp = task.get('input', '')
+            if len(inp) > 40: inp = inp[:40] + '...'
+            parts.append(f'auto: \"{inp}\" ({task.get(\"scale\", \"standard\")})')
     print(f'  One-time:  {tr[\"date\"]} {tr[\"time\"]}  [{\"  |  \".join(parts)}]')
 " 2>/dev/null) || true
     [[ -n "$_trigger_display" ]] && echo "$_trigger_display"
@@ -1320,6 +1678,132 @@ cmd_logs() {
     fi
 }
 
+cmd_jobs() {
+    local show_last=false
+    local job_id=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --last) show_last=true; shift ;;
+            *) job_id="$1"; shift ;;
+        esac
+    done
+
+    local jobs_dir="$CONFIG_DIR/jobs"
+
+    if [[ "$show_last" == true ]]; then
+        # Find most recent job
+        local latest
+        latest=$(python3 -c "
+import os, json, glob
+jobs_dir = os.path.expanduser('~/.claude-pulse/jobs')
+if not os.path.isdir(jobs_dir):
+    exit(1)
+jobs = sorted(glob.glob(os.path.join(jobs_dir, '*/meta.json')), key=os.path.getmtime, reverse=True)
+if jobs:
+    print(os.path.dirname(jobs[0]))
+else:
+    exit(1)
+" 2>/dev/null) || { info "No jobs found"; return 0; }
+
+        local summary="$latest/summary.md"
+        if [[ -f "$summary" ]]; then
+            echo ""
+            echo -e "  ${BOLD}Job: $(basename "$latest")${NC}"
+            echo ""
+            cat "$summary"
+        else
+            warn "No summary found for $(basename "$latest")"
+        fi
+        return 0
+    fi
+
+    if [[ -n "$job_id" ]]; then
+        local jdir="$jobs_dir/$job_id"
+        if [[ ! -d "$jdir" ]]; then
+            error "Job not found: $job_id"
+            return 1
+        fi
+        local summary="$jdir/summary.md"
+        if [[ -f "$summary" ]]; then
+            echo ""
+            echo -e "  ${BOLD}Job: $job_id${NC}"
+            echo ""
+            cat "$summary"
+        else
+            warn "No summary found for $job_id"
+            # Show meta instead
+            if [[ -f "$jdir/meta.json" ]]; then
+                echo ""
+                cat "$jdir/meta.json"
+            fi
+        fi
+        return 0
+    fi
+
+    # List all jobs
+    if [[ ! -d "$jobs_dir" ]]; then
+        info "No jobs yet. Auto mode tasks create jobs in ~/.claude-pulse/jobs/"
+        return 0
+    fi
+
+    local _list
+    _list=$(python3 -c "
+import os, json, glob
+
+jobs_dir = os.path.expanduser('~/.claude-pulse/jobs')
+if not os.path.isdir(jobs_dir):
+    print('(none)')
+    exit(0)
+
+metas = sorted(glob.glob(os.path.join(jobs_dir, '*/meta.json')), key=os.path.getmtime, reverse=True)
+if not metas:
+    print('(none)')
+    exit(0)
+
+GRN = '\033[32m'
+RED = '\033[31m'
+YEL = '\033[33m'
+DIM = '\033[2m'
+RST = '\033[0m'
+
+for mf in metas:
+    try:
+        with open(mf) as f:
+            m = json.load(f)
+        jid = m.get('job_id', os.path.basename(os.path.dirname(mf)))
+        status = m.get('status', '?')
+        sc = {
+            'completed': f'{GRN}completed{RST}',
+            'running': f'{YEL}running{RST}',
+            'failed': f'{RED}failed{RST}'
+        }.get(status, status)
+        inp = m.get('input_preview', '')
+        if len(inp) > 50:
+            inp = inp[:50] + '...'
+        dur = m.get('duration_seconds', 0)
+        tc = m.get('task_count', 0)
+        ws = m.get('workers_succeeded', 0)
+        wf = m.get('workers_failed', 0)
+        scale = m.get('scale', '?')
+        dur_str = f'{dur}s' if dur else '-'
+        workers_str = f'{ws}/{tc} ok' if tc else '-'
+        print(f'  {jid}  {sc}  {scale:8s}  {workers_str:6s}  {dur_str:>5s}  {DIM}{inp}{RST}')
+    except:
+        pass
+" 2>/dev/null) || _list="(none)"
+
+    echo ""
+    echo -e "  ${BOLD}=== Claude Pulse Jobs ===${NC}"
+    echo ""
+    echo -e "  ${DIM}ID                  STATUS     SCALE     WORKERS  TIME   INPUT${NC}"
+    echo "$_list"
+    echo ""
+    echo "  claude-pulse jobs --last       Show most recent summary"
+    echo "  claude-pulse jobs <job_id>     Show specific job summary"
+    echo ""
+}
+
 cmd_help() {
     cat << 'EOF'
 Claude Pulse - Auto-trigger Claude Code for token quota refresh & task execution
@@ -1332,13 +1816,26 @@ Commands:
   stop      Disable triggers
   status    Show state and configured tasks
   logs      Show trigger logs
+  jobs      List auto mode job results
   help      This message
 
 Task modes (configured during setup):
   pulse     Minimal "pulse" to keep tokens fresh (default)
   prompt    Custom prompt — Claude executes a real task
+  auto      Claude plans and executes multi-step work autonomously
 
 Multiple tasks per trigger run in parallel.
+
+Auto mode:
+  Claude analyzes the project, decomposes work into sub-tasks, runs
+  them in parallel via separate Claude Code instances, then generates
+  a summary report. Use @filepath to load input from a file.
+  Scales: light (3×5), standard (5×10), heavy (10×20)
+
+Job options:
+  jobs              List all jobs (most recent first)
+  jobs --last       Show most recent summary
+  jobs <job_id>     Show specific job summary
 
 Log options:
   --today         Today's logs
@@ -1355,6 +1852,7 @@ case "${1:-help}" in
     stop)   cmd_stop ;;
     status) cmd_status ;;
     logs)   shift; cmd_logs "$@" ;;
+    jobs)   shift; cmd_jobs "$@" ;;
     help|-h|--help) cmd_help ;;
     *)      error "Unknown: $1"; cmd_help; exit 1 ;;
 esac

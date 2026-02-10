@@ -10,7 +10,7 @@
 
 Claude Code resets its token quota every **5 hours from your last usage**. That means every night you sleep through a refresh window. Every morning you sit down to code, you're already behind.
 
-**Claude Pulse** fixes this. It schedules triggers at times you choose — a minimal pulse to keep tokens fresh, or **real tasks** that Claude Code executes autonomously. Multiple tasks per trigger, all running in parallel.
+**Claude Pulse** fixes this. It schedules triggers at times you choose — a minimal pulse to keep tokens fresh, **real tasks** that Claude Code executes autonomously, or **auto mode** where Claude plans and executes complex multi-step work with parallel workers. Multiple tasks per trigger, all running in parallel.
 
 ## How It Works
 
@@ -26,6 +26,7 @@ Claude Pulse uses macOS `launchd` to schedule triggers. Each trigger can run one
 
 - **Pulse** — a single-word prompt (~1 token, ~$0.01) to reset your quota timer
 - **Prompt** — a custom instruction that Claude Code executes autonomously (with configurable max turns and work directory)
+- **Auto** — Claude analyzes your project, decomposes work into sub-tasks, runs them in parallel via separate Claude Code instances, and generates a summary report
 
 For nighttime triggers, it can even wake your Mac from sleep using `pmset`.
 
@@ -34,6 +35,9 @@ For nighttime triggers, it can even wake your Mac from sleep using `pmset`.
 - **Multi-task triggers** — attach multiple tasks (pulse + prompts) to a single trigger time
 - **Parallel execution** — all tasks in a trigger run concurrently, not sequentially
 - **Custom prompts** — schedule real work for Claude: code reviews, test runs, refactoring
+- **Auto mode** — Claude orchestrates complex work: analyze → plan → parallel workers → summary report
+- **Scale presets** — Light (3 workers), Standard (5 workers), Heavy (10 workers)
+- **Job history** — `claude-pulse jobs` to review auto mode results and summaries
 - **Per-task logging** — `Task 1/3 [pulse] SUCCESS: 14s`, `Task 2/3 [prompt] SUCCESS: 42s`
 - **Zero typing setup** — fully interactive TUI with arrow keys
 - **Smart time grid** — 30-minute interval slots with real-time effective window preview
@@ -64,13 +68,15 @@ The task configuration flow — after selecting a time, you choose what Claude s
 ```
   Task for 13:30:
     Pulse (token refresh)
-  ▸ Custom prompt (Claude executes a task)
+    Custom prompt (Claude executes a task)
+  ▸ Auto (Claude plans and executes)
 
-  Enter prompt for Claude:
-  > 检查一下这个产品的报错问题
+  Describe the work for Claude:
+  (or @filepath to load from file)
+  > Refactor the authentication module and add unit tests
 
-  Max turns:
-  ▸ 5 (Recommended)
+  Scale:
+  ▸ Standard — 5 workers, 10 turns each (Recommended)
 
   Add another task?
   ▸ No, done
@@ -141,6 +147,9 @@ Claude Pulse handles the rest — config, launchd agents, pmset wake schedules.
 | `claude-pulse logs --today` | Today's logs |
 | `claude-pulse logs -n 50` | Last 50 entries |
 | `claude-pulse logs 2026-02-10` | Logs for specific date |
+| `claude-pulse jobs` | List all auto mode jobs |
+| `claude-pulse jobs --last` | Show most recent job summary |
+| `claude-pulse jobs <job_id>` | Show specific job summary |
 
 ## Example: Overnight Code Review + Token Refresh
 
@@ -158,6 +167,43 @@ Both tasks run **in parallel**. Logs show per-task results:
 [2026-02-10 03:30:05] Task 1/2 [pulse] SUCCESS: 8s
 [2026-02-10 03:30:47] Task 2/2 [prompt] SUCCESS: 42s "Review recent changes for bugs"
 [2026-02-10 03:30:47] Trigger finished: 2 succeeded, 0 failed out of 2 tasks
+```
+
+## Example: Auto Mode — Overnight Multi-Task Work
+
+Schedule complex work that Claude decomposes and executes in parallel:
+
+```
+  Daily 02:30:
+    - auto: "Refactor the auth module, add unit tests, update docs" (standard)
+```
+
+Claude Pulse will:
+1. **Orchestrator** — analyze the project, break work into 5 independent sub-tasks
+2. **Workers** — spawn 5 parallel Claude Code instances, each handling one sub-task (10 turns each)
+3. **Summarizer** — read all results, generate a Markdown report
+
+Check results in the morning:
+```bash
+claude-pulse jobs --last
+```
+
+Job files are stored in `~/.claude-pulse/jobs/`:
+```
+20260210-0230-a1b2/
+  ├── input.md        # Your original request
+  ├── plan.json       # Orchestrator's task decomposition
+  ├── workers/        # Individual worker outputs
+  │   ├── 01-refactor-auth.md
+  │   ├── 02-add-unit-tests.md
+  │   └── 03-update-docs.md
+  ├── summary.md      # Final summary report
+  └── meta.json       # Job metadata (status, timing, counts)
+```
+
+Use `@filepath` for longer inputs:
+```
+  > @/path/to/spec.md    ← loads file content as input (any length)
 ```
 
 ## Example: 24h Token Coverage
@@ -184,7 +230,8 @@ That's 5 triggers/day at ~$0.01 each = **~$0.05/day** for always-fresh tokens.
       "time": "03:30",
       "tasks": [
         {"mode": "pulse"},
-        {"mode": "prompt", "prompt": "Review code changes", "max_turns": 10}
+        {"mode": "prompt", "prompt": "Review code changes", "max_turns": 10},
+        {"mode": "auto", "input": "Refactor auth and add tests", "scale": "standard"}
       ]
     }
   ],
@@ -216,7 +263,8 @@ Existing v1 configs are automatically migrated on first run.
    - Launches all tasks **in parallel** (background processes)
    - Waits for all to complete, logs per-task results
    - Pulse tasks retry on failure; prompt tasks don't
-   - Cleans up expired one-time triggers and old logs (>30 days)
+   - Auto tasks run the 3-phase pipeline (orchestrator → workers → summarizer)
+   - Cleans up expired one-time triggers, old logs, and old jobs (>30 days)
 
 ## Uninstall
 
