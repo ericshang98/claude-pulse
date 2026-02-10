@@ -556,9 +556,32 @@ cmd_setup() {
     ver=$("$claude_path" --version 2>&1 | head -1) || true
     success "Found Claude CLI: $ver at $claude_path"
 
-    # Collect triggers via interactive menu
+    # Load existing triggers from config (if any)
     local -a rec_times=()
     local -a ot_triggers=()   # each element: "YYYY-MM-DD HH:MM"
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        local _existing
+        _existing=$(python3 << 'PYEOF'
+import json, os
+cfg = os.path.expanduser("~/.claude-pulse/config.json")
+with open(cfg) as f: d = json.load(f)
+for t in d.get("recurring_times", []):
+    print("REC " + t)
+for t in d.get("onetime_triggers", []):
+    print("OT " + t["date"] + " " + t["time"])
+PYEOF
+        ) || true
+        while IFS= read -r line; do
+            case "$line" in
+                REC\ *) rec_times+=("${line#REC }") ;;
+                OT\ *)  ot_triggers+=("${line#OT }") ;;
+            esac
+        done <<< "$_existing"
+        if ((${#rec_times[@]} > 0 || ${#ot_triggers[@]} > 0)); then
+            info "Loaded existing triggers from config"
+        fi
+    fi
 
     while true; do
         # Show current triggers
