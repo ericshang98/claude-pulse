@@ -158,6 +158,16 @@ ui_time_grid() {
         done
     fi
 
+    # Determine which slots are in the past (for today only)
+    local now_hhmm=""
+    local _is_today=false
+    local _today_str
+    _today_str=$(date +%Y-%m-%d)
+    if [[ -z "$base_date" || "$base_date" == "$_today_str" ]]; then
+        _is_today=true
+        now_hhmm=$(date +%H:%M)
+    fi
+
     # Precompute date info (avoid calling date on every keystroke)
     local -a _cn=("日" "一" "二" "三" "四" "五" "六")
     local -a _en=("Sun" "Mon" "Tue" "Wed" "Thu" "Fri" "Sat")
@@ -201,6 +211,12 @@ print(d.strftime('%w'), d.strftime('%m/%d'), nd.strftime('%w'), nd.strftime('%m/
                 local on_cur=0
                 [[ $r -eq $cr && $c -eq $cc ]] && on_cur=1
 
+                # Past slot? (blue for times already passed today)
+                local is_past=false
+                if [[ "$_is_today" == true && -n "$now_hhmm" && "$t" < "$now_hhmm" ]]; then
+                    is_past=true
+                fi
+
                 if [[ $on_cur -eq 1 ]]; then
                     if [[ ${sel[$idx]} -eq 1 ]]; then
                         printf ' \033[7;32m %s \033[0m' "$t"
@@ -210,6 +226,8 @@ print(d.strftime('%w'), d.strftime('%m/%d'), nd.strftime('%w'), nd.strftime('%m/
                 else
                     if [[ ${sel[$idx]} -eq 1 ]]; then
                         printf ' \033[32m[%s]\033[0m' "$t"
+                    elif [[ "$is_past" == true ]]; then
+                        printf '  \033[34m%s\033[0m ' "$t"
                     else
                         printf '  %s ' "$t"
                     fi
@@ -292,13 +310,18 @@ print(d.strftime('%w'), d.strftime('%m/%d'), nd.strftime('%w'), nd.strftime('%m/
 # Date selector (next 14 days).  Sets UI_DATE_RESULT (YYYY-MM-DD or empty).
 ui_date_selector() {
     local -a dates=() labels=()
+    local today_str
+    today_str=$(date +%Y-%m-%d)
     local -a cn_days=("日 Sun" "一 Mon" "二 Tue" "三 Wed" "四 Thu" "五 Fri" "六 Sat")
     for ((d=0; d<=14; d++)); do
         local ds dow
         ds=$(date -v+${d}d +%Y-%m-%d)
         dow=$(date -v+${d}d +%w)   # 0=Sunday
         dates+=("$ds")
-        labels+=("$(date -v+${d}d +%m/%d)  ${cn_days[$dow]}")
+        local lbl
+        lbl="$(date -v+${d}d +%m/%d)  ${cn_days[$dow]}"
+        [[ "$ds" == "$today_str" ]] && lbl+="  (today)"
+        labels+=("$lbl")
     done
 
     local cnt=${#dates[@]} sel=0
@@ -313,8 +336,12 @@ ui_date_selector() {
         printf '  \033[1mSelect date\033[0m  \033[2m↑↓ move  Enter select  q back\033[0m\n'
         printf '\n'
         for i in "${!labels[@]}"; do
+            local _color=""
+            [[ "${dates[$i]}" == "$today_str" ]] && _color="\033[32m"
             if [[ $i -eq $sel ]]; then
                 printf '  \033[36m▸ %s\033[0m\033[K\n' "${labels[$i]}"
+            elif [[ -n "$_color" ]]; then
+                printf "  ${_color}  %s\033[0m\033[K\n" "${labels[$i]}"
             else
                 printf '    %s\033[K\n' "${labels[$i]}"
             fi
@@ -822,12 +849,20 @@ o = json.loads(os.environ['ONETIME'])
 if not r and not o:
     exit(0)
 
+from datetime import date, datetime
+today = date.today().isoformat()
+now_hhmm = datetime.now().strftime('%H:%M')
+GRN = '\033[32m'; BLU = '\033[34m'; RST2 = '\033[0m'
+
 lines = []
 lines.append('\033[0;34mConfigured triggers:\033[0m')
 for tr in r:
     t = tr['time']
     tasks = tr.get('tasks', [{'mode': 'pulse'}])
-    lines.append(f'  Daily {t}:')
+    if t < now_hhmm:
+        lines.append(f'  {BLU}Daily {t}:{RST2}')
+    else:
+        lines.append(f'  Daily {t}:')
     for task in tasks:
         if task['mode'] == 'pulse':
             lines.append(f'    - pulse')
@@ -843,7 +878,16 @@ for tr in o:
     d = tr['date']
     t = tr['time']
     tasks = tr.get('tasks', [{'mode': 'pulse'}])
-    lines.append(f'  One-time {d} {t}:')
+    if d == today:
+        dc = GRN
+    elif d < today:
+        dc = BLU
+    else:
+        dc = ''
+    if dc:
+        lines.append(f'  {dc}One-time {d} {t}:{RST2}')
+    else:
+        lines.append(f'  One-time {d} {t}:')
     for task in tasks:
         if task['mode'] == 'pulse':
             lines.append(f'    - pulse')
